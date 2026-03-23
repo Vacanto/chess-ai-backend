@@ -17,33 +17,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Stockfish configuration
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import chess
-import chess.engine
-
-app = FastAPI(title="Chess AI API")
-
-# ✅ Allow all origins (for mobile + frontend)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ✅ STOCKFISH (FINAL FIX)
 try:
-    engine_path = "./stockfish"   # 👈 IMPORTANT (your bundled binary)
+    engine_path = "./stockfish/stockfish-ubuntu-x86-64-avx2"  # ✅ USE SYSTEM STOCKFISH
     engine = chess.engine.SimpleEngine.popen_uci(engine_path)
     print(f"✓ Stockfish loaded from: {engine_path}")
 except Exception as e:
     print(f"✗ Error loading Stockfish: {e}")
     engine = None
-
 
 # ─────────────────────────────────────────────
 # MODELS
