@@ -5,9 +5,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Render maps the PostgreSQL database URL to 'DATABASE_URL'
-# SQLAlchemy's async driver requires postgresql+asyncpg instead of standard postgres://
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:password@localhost/chess_coach")
+# Check for Render DATABASE_URL
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    # We fallback to localhost just for local testing, 
+    # but print a big warning so we know why it crashes in production
+    print("⚠️ WARNING: DATABASE_URL environment variable is not set. Falling back to localhost PostgreSQL.")
+    DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost/chess_coach"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
