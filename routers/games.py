@@ -4,7 +4,8 @@ from sqlalchemy import select
 
 from database.database import get_db
 from models.game import Game
-from schemas.game import GameCreate, GameResponse, GameUpdatePGN, GameUpdateStatus
+from schemas.game import GameCreate, GameResponse, GameUpdatePGN, GameUpdateStatus, MoveRequest, MoveResponse
+from services.chess_logic import process_move
 
 router = APIRouter(prefix="/games", tags=["Games"])
 
@@ -60,3 +61,28 @@ async def update_status(game_id: int, status_data: GameUpdateStatus, db: AsyncSe
     await db.commit()
     await db.refresh(game)
     return game
+
+@router.post("/{game_id}/move", response_model=MoveResponse)
+async def make_move(game_id: int, request: MoveRequest, db: AsyncSession = Depends(get_db)):
+    """Process a UCI move, validate it via python-chess, and update the game."""
+    result = await db.execute(select(Game).filter(Game.id == game_id))
+    game = result.scalars().first()
+    
+    if not game:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Game not found")
+    
+    # Process the move using our chess engine service
+    is_valid, new_fen, new_pgn = process_move(game.pgn, request.move)
+    
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"Invalid move: {request.move} for the current board state."
+        )
+    
+    # Save the updated state to the Database
+    game.pgn = new_pgn
+    await db.commit()
+    
+    return MoveResponse(valid=True, new_fen=new_fen, pgn=new_pgn)
+

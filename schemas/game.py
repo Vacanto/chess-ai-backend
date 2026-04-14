@@ -27,3 +27,14 @@ class GameResponse(BaseModel):
 
     # This allows Pydantic to read data from SQLAlchemy models
     model_config = ConfigDict(from_attributes=True)
+
+# Schema for submitting a chess move
+class MoveRequest(BaseModel):
+    move: str  # e.g., "e2e4" (UCI format)
+
+# Schema for validation response
+class MoveResponse(BaseModel):
+    valid: bool
+    new_fen: str
+    pgn: str
+

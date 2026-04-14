@@ -3,14 +3,18 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from typing import AsyncGenerator
 from dotenv import load_dotenv
 
-load_dotenv()
+env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+load_dotenv(dotenv_path=env_path)
 
-# Check for Render DATABASE_URL
+# Render sets 'RENDER' to 'true' automatically
+is_production = os.getenv("RENDER") == "true"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
+    if is_production:
+        raise ValueError("\n\n❌ CRITICAL: 'DATABASE_URL' environment variable is missing!\nGo to the 'Environment' tab in your Render Web Service dashboard and add it, then redeploy.\n\n")
+
     print("WARNING: DATABASE_URL environment variable is not set. Falling back to local SQLite.")
-    # DO NOT hardcode your Render password here, it will leak to GitHub!
     DATABASE_URL = "sqlite+aiosqlite:///./chess_coach.db"
 
 if DATABASE_URL.startswith("postgres://"):
