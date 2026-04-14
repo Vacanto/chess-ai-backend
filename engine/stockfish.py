@@ -3,6 +3,9 @@ import chess
 import chess.engine
 import os
 import stat
+import shutil
+import urllib.request
+import tarfile
 
 # Default to ./stockfish at root, or use environment variable if provided
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,14 +17,55 @@ if os.name == 'nt' and not STOCKFISH_PATH.endswith('.exe'):
     if os.path.exists(test_path):
         STOCKFISH_PATH = test_path
 
-# Utility to ensure Stockfish has executable permissions (vital for Linux deployments like Render)
-def ensure_executable(path):
-    if os.path.exists(path):
-        st = os.stat(path)
-        os.chmod(path, st.st_mode | stat.S_IEXEC)
+def setup_stockfish():
+    global STOCKFISH_PATH
+    
+    # On Windows, just return the path (assuming local exe is fine)
+    if os.name == 'nt':
+        return STOCKFISH_PATH
+        
+    # We want a path where we have full permissions
+    workable_path = "/tmp/stockfish_bin"
+    
+    if os.path.exists(workable_path) and os.access(workable_path, os.X_OK):
+        STOCKFISH_PATH = workable_path
+        return STOCKFISH_PATH
+        
+    # If the user provided stockfish via Render Secret File (often read-only/no-exec)
+    if os.path.exists(STOCKFISH_PATH):
+        try:
+            shutil.copy2(STOCKFISH_PATH, workable_path)
+            os.chmod(workable_path, os.stat(workable_path).st_mode | stat.S_IEXEC)
+            STOCKFISH_PATH = workable_path
+            return STOCKFISH_PATH
+        except Exception as e:
+            print(f"Error copying/chmodding existing stockfish: {e}")
+            
+    # If it doesn't exist or we failed to copy it, download it
+    print("Downloading stockfish for linux environment...")
+    url = "https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/stockfish-ubuntu-x86-64-avx2.tar"
+    tar_path = "/tmp/sf.tar"
+    try:
+        urllib.request.urlretrieve(url, tar_path)
+        with tarfile.open(tar_path) as tar:
+            for member in tar.getmembers():
+                if "stockfish-ubuntu-x86-64" in member.name and member.isfile():
+                    # Extract to workable_path directly
+                    with tar.extractfile(member) as source, open(workable_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
+                    break
+        os.remove(tar_path)
+        os.chmod(workable_path, os.stat(workable_path).st_mode | stat.S_IEXEC)
+        STOCKFISH_PATH = workable_path
+    except Exception as e:
+        print(f"Failed to download stockfish: {e}")
+        
+    return STOCKFISH_PATH
+
+# Initialize stockfish path properly
+STOCKFISH_PATH = setup_stockfish()
 
 async def get_best_move_async(fen: str, time_limit: float = 0.1):
-    ensure_executable(STOCKFISH_PATH)
     board = chess.Board(fen)
     transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
     try:
@@ -31,7 +75,6 @@ async def get_best_move_async(fen: str, time_limit: float = 0.1):
         await engine.quit()
 
 async def analyze_position_async(fen: str, time_limit: float = 0.1):
-    ensure_executable(STOCKFISH_PATH)
     board = chess.Board(fen)
     transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
     try:
