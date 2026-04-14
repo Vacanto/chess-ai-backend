@@ -9,8 +9,9 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    print("WARNING: DATABASE_URL environment variable is not set. Falling back to the Render internal DB URL.")
-    DATABASE_URL = "postgresql+asyncpg://chess_wmoh_user:IuajQEQXoaIU4mUgoFVSbTGcPxphCHUy@dpg-d76g3kuuk2gs73eun8o0-a/chess_wmoh"
+    print("WARNING: DATABASE_URL environment variable is not set. Falling back to local SQLite.")
+    # DO NOT hardcode your Render password here, it will leak to GitHub!
+    DATABASE_URL = "sqlite+aiosqlite:///./chess_coach.db"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)

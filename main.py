@@ -4,8 +4,10 @@ from contextlib import asynccontextmanager
 
 from database.database import engine
 from models.base import Base
+from models.game import Game
 from routers import health
 from routers.engine import router as engine_router
+from routers.games import router as games_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,7 +33,7 @@ app.add_middleware(
 # Include Routers
 app.include_router(health.router)
 app.include_router(engine_router)
-
+app.include_router(games_router, prefix="/api/v1")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
