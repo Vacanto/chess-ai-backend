@@ -9,10 +9,8 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    # We fallback to localhost just for local testing, 
-    # but print a big warning so we know why it crashes in production
-    print("⚠️ WARNING: DATABASE_URL environment variable is not set. Falling back to localhost PostgreSQL.")
-    DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost/chess_coach"
+    print("WARNING: DATABASE_URL environment variable is not set. Falling back to the Render internal DB URL.")
+    DATABASE_URL = "postgresql+asyncpg://chess_wmoh_user:IuajQEQXoaIU4mUgoFVSbTGcPxphCHUy@dpg-d76g3kuuk2gs73eun8o0-a/chess_wmoh"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
