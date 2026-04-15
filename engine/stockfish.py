@@ -27,30 +27,48 @@ def setup_stockfish():
     # We want a path where we have full permissions
     workable_path = "/tmp/stockfish_bin"
     
+    # 1. Check if we already have it in /tmp (previous run)
     if os.path.exists(workable_path) and os.access(workable_path, os.X_OK):
         STOCKFISH_PATH = workable_path
         return STOCKFISH_PATH
         
-    # If the user provided stockfish via Render Secret File (often read-only/no-exec)
-    if os.path.exists(STOCKFISH_PATH):
-        try:
-            shutil.copy2(STOCKFISH_PATH, workable_path)
-            os.chmod(workable_path, os.stat(workable_path).st_mode | stat.S_IEXEC)
-            STOCKFISH_PATH = workable_path
-            return STOCKFISH_PATH
-        except Exception as e:
-            print(f"Error copying/chmodding existing stockfish: {e}")
+    # 2. Check the provided path or common Render paths
+    # Note: User's start command puts binary at ./stockfish/stockfish-ubuntu-x86-64-avx2
+    possible_paths = [
+        STOCKFISH_PATH,                                              # Current path env/default
+        os.path.join(BASE_DIR, "stockfish", "stockfish-ubuntu-x86-64-avx2"), # Render start command path
+        os.path.join(BASE_DIR, "stockfish")                           # Direct file check
+    ]
+    
+    for p in possible_paths:
+        if os.path.exists(p):
+            # If it's a directory, look inside it
+            if os.path.isdir(p):
+                binary_guess = os.path.join(p, "stockfish-ubuntu-x86-64-avx2")
+                if os.path.exists(binary_guess):
+                    p = binary_guess
+                else:
+                    continue # It's a directory but doesn't have the binary inside
             
-    # If it doesn't exist or we failed to copy it, download it
-    print("Downloading stockfish for linux environment...")
-    url = "https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/stockfish-ubuntu-x86-64-avx2.tar"
+            try:
+                # Copy to /tmp to ensure exec permissions on Render/Linux
+                shutil.copy2(p, workable_path)
+                os.chmod(workable_path, os.stat(workable_path).st_mode | stat.S_IEXEC)
+                STOCKFISH_PATH = workable_path
+                print(f"Using Stockfish binary found at: {p}")
+                return STOCKFISH_PATH
+            except Exception as e:
+                print(f"Error copying/chmodding stockfish from {p}: {e}")
+            
+    # 3. If it doesn't exist or we failed to copy it, download it as fallback
+    print("Fallback: Downloading stockfish for linux environment...")
+    url = "https://github.com/official-stockfish/Stockfish/releases/download/sf_17/stockfish-ubuntu-x86-64-avx2.tar"
     tar_path = "/tmp/sf.tar"
     try:
         urllib.request.urlretrieve(url, tar_path)
         with tarfile.open(tar_path) as tar:
             for member in tar.getmembers():
                 if "stockfish-ubuntu-x86-64" in member.name and member.isfile():
-                    # Extract to workable_path directly
                     with tar.extractfile(member) as source, open(workable_path, "wb") as target:
                         shutil.copyfileobj(source, target)
                     break
@@ -58,7 +76,7 @@ def setup_stockfish():
         os.chmod(workable_path, os.stat(workable_path).st_mode | stat.S_IEXEC)
         STOCKFISH_PATH = workable_path
     except Exception as e:
-        print(f"Failed to download stockfish: {e}")
+        print(f"Failed to download stockfish fallback: {e}")
         
     return STOCKFISH_PATH
 
