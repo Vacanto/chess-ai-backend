@@ -4,6 +4,7 @@ from sqlalchemy import select
 import chess
 import chess.pgn
 import io
+from pydantic import BaseModel
 
 from database.database import get_db
 from models.game import Game
@@ -13,6 +14,9 @@ from engine.stockfish import bulk_analyze_async
 
 router = APIRouter(prefix="/analysis", tags=["Game Analysis"])
 
+class PGNAnalysisRequest(BaseModel):
+    pgn: str
+    time_limit: float = 0.15
 
 def classify_move(cp_loss: int, is_best_move: bool, num_legal_moves: int) -> str:
     """
@@ -187,6 +191,80 @@ async def generate_game_analysis(game_id: int, db: AsyncSession = Depends(get_db
         ))
         
     return GameAnalysisHistory(game_id=game.id, evaluations=response_evals)
+
+@router.post("/pgn", response_model=GameAnalysisHistory)
+async def analyze_pgn(req: PGNAnalysisRequest):
+    """
+    Parses a PGN string natively and returns step-by-step analysis without saving to the DB.
+    """
+    if not req.pgn:
+        raise HTTPException(status_code=400, detail="Empty PGN provided.")
+        
+    pgn_io = io.StringIO(req.pgn)
+    chess_game = chess.pgn.read_game(pgn_io)
+    
+    if not chess_game:
+        raise HTTPException(status_code=400, detail="Invalid PGN string.")
+        
+    board = chess_game.board()
+    fens = [board.fen()]
+    moves_played = [None]
+    move_colors = [None]
+    legal_move_counts = [len(list(board.legal_moves))]
+    sansi = [None]
+    
+    for move in chess_game.mainline_moves():
+        sansi.append(board.san(move))
+        move_colors.append("white" if board.turn == chess.WHITE else "black")
+        moves_played.append(move.uci())
+        legal_move_counts.append(len(list(board.legal_moves)))
+        board.push(move)
+        fens.append(board.fen())
+        
+    try:
+        evals = await bulk_analyze_async(fens, time_limit=req.time_limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stockfish engine error: {e}")
+
+    classifications = [None]
+    
+    for i in range(1, len(evals)):
+        prev_eval = evals[i - 1]["score"]
+        curr_eval = evals[i]["score"]
+        prev_is_mate = evals[i - 1]["mate"]
+        curr_is_mate = evals[i]["mate"]
+        white_moved = (move_colors[i] == "white")
+        
+        cp_loss = _compute_cp_loss(prev_eval, curr_eval, prev_is_mate, curr_is_mate, white_moved)
+        
+        best_move_at_source = evals[i - 1].get("best_move")
+        actual_move = moves_played[i]
+        is_best = (actual_move == best_move_at_source) if best_move_at_source and actual_move else False
+        
+        num_legal = legal_move_counts[i]
+        
+        classification = classify_move(max(0, cp_loss), is_best, num_legal)
+        classifications.append(classification)
+
+    response_evals = []
+    for ply, eval_data in enumerate(evals):
+        # Format the classification safely
+        formatted_class = classifications[ply].capitalize() if classifications[ply] else None
+        
+        response_evals.append(AnalysisResponse(
+            id=ply,
+            game_id=0,
+            ply=ply,
+            fen=eval_data["fen"],
+            score=eval_data["score"],
+            is_mate=eval_data["mate"],
+            best_move=eval_data["best_move"],
+            move_played=moves_played[ply] if ply < len(moves_played) else None,
+            classification=formatted_class,
+            created_at=None
+        ))
+        
+    return GameAnalysisHistory(game_id=0, evaluations=response_evals)
 
 @router.get("/{game_id}", response_model=GameAnalysisHistory)
 async def get_game_analysis(game_id: int, db: AsyncSession = Depends(get_db)):
