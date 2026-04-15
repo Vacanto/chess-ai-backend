@@ -106,16 +106,16 @@ async def analyze_position_async(fen: str, time_limit: float = 0.1):
         if board.is_game_over():
             if board.is_checkmate():
                 s = -100000 if board.turn == chess.WHITE else 100000
-                return {"score": s, "mate": True, "pv": []}
+                return {"score": s, "is_mate": True, "pv": []}
             else:
-                return {"score": 0, "mate": False, "pv": []}
+                return {"score": 0, "is_mate": False, "pv": []}
 
         info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
         score_val, is_mate, _ = _extract_score(info)
 
         return {
             "score": score_val,
-            "mate": is_mate,
+            "is_mate": is_mate,
             "pv": [m.uci() for m in info.get("pv", [])]
         }
     finally:
@@ -142,7 +142,7 @@ async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
                     results.append({
                         "fen": fen,
                         "score": score_val,
-                        "mate": True,
+                        "is_mate": True,
                         "best_move": None
                     })
                 else:
@@ -150,7 +150,7 @@ async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
                     results.append({
                         "fen": fen,
                         "score": 0,
-                        "mate": False,
+                        "is_mate": False,
                         "best_move": None
                     })
                 continue
@@ -161,7 +161,7 @@ async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
             results.append({
                 "fen": fen,
                 "score": score_val,
-                "mate": is_mate,
+                "is_mate": is_mate,
                 "best_move": best_move
             })
             

@@ -134,8 +134,8 @@ async def generate_game_analysis(game_id: int, db: AsyncSession = Depends(get_db
     for i in range(1, len(evals)):
         prev_eval = evals[i - 1]["score"]
         curr_eval = evals[i]["score"]
-        prev_is_mate = evals[i - 1]["mate"]
-        curr_is_mate = evals[i]["mate"]
+        prev_is_mate = evals[i - 1]["is_mate"]
+        curr_is_mate = evals[i]["is_mate"]
         white_moved = (move_colors[i] == "white")
         
         # Centipawn loss from the mover's perspective
@@ -231,8 +231,8 @@ async def analyze_pgn(req: PGNAnalysisRequest):
     for i in range(1, len(evals)):
         prev_eval = evals[i - 1]["score"]
         curr_eval = evals[i]["score"]
-        prev_is_mate = evals[i - 1]["mate"]
-        curr_is_mate = evals[i]["mate"]
+        prev_is_mate = evals[i - 1]["is_mate"]
+        curr_is_mate = evals[i]["is_mate"]
         white_moved = (move_colors[i] == "white")
         
         cp_loss = _compute_cp_loss(prev_eval, curr_eval, prev_is_mate, curr_is_mate, white_moved)
