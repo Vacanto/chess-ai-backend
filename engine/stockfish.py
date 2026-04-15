@@ -93,3 +93,35 @@ async def analyze_position_async(fen: str, time_limit: float = 0.1):
         }
     finally:
         await engine.quit()
+
+async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
+    """
+    Evaluates a list of FENs using a single engine instance securely.
+    Returns a list of dicts with the analysis for each FEN.
+    """
+    transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
+    results = []
+    
+    try:
+        for fen in fens:
+            board = chess.Board(fen)
+            info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
+            
+            score = info["score"].white()
+            is_mate = score.is_mate()
+            score_val = score.score() if not is_mate else (100000 if score.mate() > 0 else -100000)
+            
+            pv = [m.uci() for m in info.get("pv", [])]
+            best_move = pv[0] if pv else None
+            
+            results.append({
+                "fen": fen,
+                "score": score_val,
+                "mate": is_mate,
+                "best_move": best_move
+            })
+            
+    finally:
+        await engine.quit()
+        
+    return results
