@@ -65,6 +65,30 @@ def setup_stockfish():
 # Initialize stockfish path properly
 STOCKFISH_PATH = setup_stockfish()
 
+def _extract_score(info):
+    """
+    Safely extract score, mate flag, and best move from engine analysis info.
+    Returns (score_centipawns: int, is_mate: bool, best_move: str | None).
+    """
+    score = info["score"].white()
+    is_mate = score.is_mate()
+
+    if is_mate:
+        mate_in = score.mate()
+        # Mate(0) means the side to move is already checkmated
+        if mate_in == 0:
+            score_val = -100000
+        else:
+            score_val = 100000 if mate_in > 0 else -100000
+    else:
+        score_val = score.score(default=0)
+
+    pv = [m.uci() for m in info.get("pv", [])]
+    best_move = pv[0] if pv else None
+
+    return score_val, is_mate, best_move
+
+
 async def get_best_move_async(fen: str, time_limit: float = 0.1):
     board = chess.Board(fen)
     transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
@@ -78,14 +102,17 @@ async def analyze_position_async(fen: str, time_limit: float = 0.1):
     board = chess.Board(fen)
     transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
     try:
+        # Handle terminal positions without calling the engine
+        if board.is_game_over():
+            if board.is_checkmate():
+                s = -100000 if board.turn == chess.WHITE else 100000
+                return {"score": s, "mate": True, "pv": []}
+            else:
+                return {"score": 0, "mate": False, "pv": []}
+
         info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
-        
-        # safely extract the score from white's perspective
-        score = info["score"].white()
-        is_mate = score.is_mate()
-        # If it's mate, score.score() is None, mate() returns moves to mate
-        score_val = score.score() if not is_mate else (100000 if score.mate() > 0 else -100000)
-        
+        score_val, is_mate, _ = _extract_score(info)
+
         return {
             "score": score_val,
             "mate": is_mate,
@@ -96,8 +123,9 @@ async def analyze_position_async(fen: str, time_limit: float = 0.1):
 
 async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
     """
-    Evaluates a list of FENs using a single engine instance securely.
+    Evaluates a list of FENs using a single engine instance.
     Returns a list of dicts with the analysis for each FEN.
+    Handles terminal positions (checkmate/stalemate) gracefully.
     """
     transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
     results = []
@@ -105,14 +133,30 @@ async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
     try:
         for fen in fens:
             board = chess.Board(fen)
+            
+            # Handle terminal positions without querying the engine
+            if board.is_game_over():
+                if board.is_checkmate():
+                    # The side to move is checkmated
+                    score_val = -100000 if board.turn == chess.WHITE else 100000
+                    results.append({
+                        "fen": fen,
+                        "score": score_val,
+                        "mate": True,
+                        "best_move": None
+                    })
+                else:
+                    # Stalemate or other draw
+                    results.append({
+                        "fen": fen,
+                        "score": 0,
+                        "mate": False,
+                        "best_move": None
+                    })
+                continue
+
             info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
-            
-            score = info["score"].white()
-            is_mate = score.is_mate()
-            score_val = score.score() if not is_mate else (100000 if score.mate() > 0 else -100000)
-            
-            pv = [m.uci() for m in info.get("pv", [])]
-            best_move = pv[0] if pv else None
+            score_val, is_mate, best_move = _extract_score(info)
             
             results.append({
                 "fen": fen,

@@ -10,6 +10,8 @@ class AnalysisResponse(BaseModel):
     score: int
     is_mate: bool
     best_move: Optional[str] = None
+    move_played: Optional[str] = None
+    classification: Optional[str] = None
     created_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
