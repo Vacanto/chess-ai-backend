@@ -206,18 +206,16 @@ async def bulk_analyze_async(fens: list[str], debug: bool = False):
                 
                 prev_eval = current_eval
             
-            results.append({
-                "fen": fen,
-                "score": analysis_p2[0]["score"], # Deep eval
-                "best_move": analysis_p2[0]["best_move"],
-                "multipv": analysis_p1, # Top 3 from fast scan
-                "depth_used": adaptive_depth,
-                "cache_hit": cache_hit_p2,
-                "is_forcing": any(board.is_capture(m) or board.gives_check(m) for m in board.legal_moves)
-            })
+                results.append({
+                    "fen": fen,
+                    "score": analysis_p2[0]["score"], # Deep eval
+                    "best_move": analysis_p2[0]["best_move"],
+                    "multipv": analysis_p1, # Top 3 from fast scan
+                    "depth_used": adaptive_depth,
+                    "cache_hit": cache_hit_p2,
+                    "is_forcing": any(board.is_capture(m) or board.gives_check(m) for m in board.legal_moves)
+                })
+        finally:
+            await engine.quit()
             
-    
-    finally:
-        await engine.quit()
-        
-    return results
+        return results
