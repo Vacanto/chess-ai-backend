@@ -11,6 +11,12 @@ class Analysis(Base):
     fen = Column(String, nullable=False)
     score = Column(Integer, nullable=False) # Advantage in centipawns (from white's perspective)
     is_mate = Column(Boolean, default=False)
+    accuracy = Column(Integer, default=0) # Move accuracy (0-100)
+    cp_loss = Column(Integer, default=0) # Centipawn loss compared to best move
+    best_move_eval = Column(Integer, nullable=True) # Score of best move at this ply
+    played_move_eval = Column(Integer, nullable=True) # Score of played move at this ply
+    depth_used = Column(Integer, default=0) # Engine depth used for this specific position
+    
     best_move = Column(String, nullable=True) # The engine's recommended move from this position
     move_played = Column(String, nullable=True) # The actual UCI move that was played (None for starting position)
     classification = Column(String, nullable=True) # Move quality: best, excellent, good, inaccuracy, mistake, blunder, forced

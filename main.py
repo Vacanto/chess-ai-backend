@@ -10,6 +10,7 @@ from routers import health
 from routers.engine import router as engine_router
 from routers.games import router as games_router
 from routers.analysis import router as analysis_router
+from ws.game import router as ws_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

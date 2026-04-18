@@ -11,6 +11,9 @@ import tarfile
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", os.path.join(BASE_DIR, "stockfish"))
 
+# Limit concurrent engine instances
+ENGINE_SEMAPHORE = asyncio.Semaphore(2)
+
 # On Windows locally, if stockfish.exe exists, use that.
 if os.name == 'nt' and not STOCKFISH_PATH.endswith('.exe'):
     test_path = STOCKFISH_PATH + ".exe"
@@ -83,106 +86,137 @@ def setup_stockfish():
 # Initialize stockfish path properly
 STOCKFISH_PATH = setup_stockfish()
 
-def _extract_score(info):
-    """
-    Safely extract score, mate flag, and best move from engine analysis info.
-    Returns (score_centipawns: int, is_mate: bool, best_move: str | None).
-    """
-    score = info["score"].white()
-    is_mate = score.is_mate()
+# Constants
+MATE_SCORE = 30000
+FEN_CACHE = {}  # In-memory FEN cache: { (fen, depth): analysis_result }
 
-    if is_mate:
-        mate_in = score.mate()
+async def get_adaptive_depth(board: chess.Board) -> int:
+    """
+    Computes depth based on position complexity.
+    Base 14, +2 for check, +2 for endgame (<10 pieces), +2 for forcing moves.
+    """
+    depth = 14
+    if board.is_check():
+        depth += 2
+    
+    piece_count = len(board.piece_map())
+    if piece_count <= 10:
+        depth += 2
+        
+    forcing_moves = any(board.is_capture(m) or board.gives_check(m) for m in board.legal_moves)
+    if forcing_moves:
+        depth += 2
+        
+    return min(depth, 20)
+
+def normalize_score(score, board_turn):
+    """
+    Normalizes engine score into centipawns with stable mate handling.
+    Always returns from White's perspective.
+    """
+    sc = score.white()
+    if sc.is_mate():
+        mate_in = sc.mate()
         # Mate(0) means the side to move is already checkmated
         if mate_in == 0:
-            score_val = -100000
-        else:
-            score_val = 100000 if mate_in > 0 else -100000
-    else:
-        score_val = score.score(default=0)
+            return -MATE_SCORE if board_turn == chess.WHITE else MATE_SCORE
+        
+        # Stability: decrease score as mate gets further away
+        cp = MATE_SCORE - abs(mate_in) * 100
+        return cp if mate_in > 0 else -cp
+    return sc.score(default=0)
 
-    pv = [m.uci() for m in info.get("pv", [])]
-    best_move = pv[0] if pv else None
-
-    return score_val, is_mate, best_move
-
-
-async def get_best_move_async(fen: str, time_limit: float = 0.1):
-    board = chess.Board(fen)
-    transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
-    try:
-        result = await engine.play(board, chess.engine.Limit(time=time_limit))
-        return result.move.uci() if result.move else None
-    finally:
-        await engine.quit()
-
-async def analyze_position_async(fen: str, time_limit: float = 0.1):
-    board = chess.Board(fen)
-    transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
-    try:
-        # Handle terminal positions without calling the engine
-        if board.is_game_over():
-            if board.is_checkmate():
-                s = -100000 if board.turn == chess.WHITE else 100000
-                return {"score": s, "is_mate": True, "pv": []}
-            else:
-                return {"score": 0, "is_mate": False, "pv": []}
-
-        info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
-        score_val, is_mate, _ = _extract_score(info)
-
-        return {
-            "score": score_val,
-            "is_mate": is_mate,
-            "pv": [m.uci() for m in info.get("pv", [])]
-        }
-    finally:
-        await engine.quit()
-
-async def bulk_analyze_async(fens: list[str], time_limit: float = 0.1):
+def _extract_analysis(info, board):
     """
-    Evaluates a list of FENs using a single engine instance.
-    Returns a list of dicts with the analysis for each FEN.
-    Handles terminal positions (checkmate/stalemate) gracefully.
+    Extracts multi-PV analysis from engine info.
     """
-    transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
-    results = []
+    if not isinstance(info, list):
+        info = [info]
+        
+    lines = []
+    for entry in info:
+        score_cp = normalize_score(entry["score"], board.turn)
+        pv = [m.uci() for m in entry.get("pv", [])]
+        lines.append({
+            "score": score_cp,
+            "pv": pv,
+            "best_move": pv[0] if pv else None
+        })
+    return lines
+
+async def analyze_position_async(engine, board: chess.Board, depth: int, multipv: int = 1):
+    """
+    Internal helper to analyze a position with caching.
+    """
+    fen = board.fen()
+    cache_key = f"{fen}_{depth}_{multipv}"
     
-    try:
-        for fen in fens:
-            board = chess.Board(fen)
-            
-            # Handle terminal positions without querying the engine
-            if board.is_game_over():
-                if board.is_checkmate():
-                    # The side to move is checkmated
-                    score_val = -100000 if board.turn == chess.WHITE else 100000
-                    results.append({
-                        "fen": fen,
-                        "score": score_val,
-                        "is_mate": True,
-                        "best_move": None
-                    })
-                else:
-                    # Stalemate or other draw
-                    results.append({
-                        "fen": fen,
-                        "score": 0,
-                        "is_mate": False,
-                        "best_move": None
-                    })
-                continue
+    if cache_key in FEN_CACHE:
+        return FEN_CACHE[cache_key], True
 
-            info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
-            score_val, is_mate, best_move = _extract_score(info)
+    # Handle terminal positions
+    if board.is_game_over():
+        if board.is_checkmate():
+            s = -MATE_SCORE if board.turn == chess.WHITE else MATE_SCORE
+            res = [{"score": s, "pv": [], "best_move": None}]
+        else:
+            res = [{"score": 0, "pv": [], "best_move": None}]
+        FEN_CACHE[cache_key] = res
+        return res, False
+
+    info = await engine.analyse(board, chess.engine.Limit(depth=depth), multipv=multipv)
+    res = _extract_analysis(info, board)
+    
+    FEN_CACHE[cache_key] = res
+    return res, False
+
+async def bulk_analyze_async(fens: list[str], debug: bool = False):
+    """
+    Evaluates a list of FENs using Multi-Pass Analysis.
+    Returns detailed results for each FEN.
+    """
+    async with ENGINE_SEMAPHORE:
+        transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
+        results = []
+        
+        try:
+            prev_eval = 0
+            for fen in fens:
+                board = chess.Board(fen)
+                
+                # --- PASS 1: Fast Scan ---
+                pass1_depth = 12
+                pass1_multipv = 3
+                analysis_p1, cache_hit_p1 = await analyze_position_async(engine, board, pass1_depth, pass1_multipv)
+                
+                best_line = analysis_p1[0]
+                current_eval = best_line.get("score", 0)
+                
+                # --- PASS 2: Selective Deep Analysis ---
+                is_decided = abs(current_eval) > 500
+                diff_from_prev = abs(current_eval - prev_eval)
+                is_blunder = diff_from_prev > 300
+                
+                if is_decided or is_blunder:
+                    analysis_p2, cache_hit_p2 = analysis_p1[:1], cache_hit_p1
+                    adaptive_depth = pass1_depth
+                else:
+                    adaptive_depth = await get_adaptive_depth(board)
+                    analysis_p2, cache_hit_p2 = await analyze_position_async(engine, board, adaptive_depth, multipv=1)
+                
+                prev_eval = current_eval
             
             results.append({
                 "fen": fen,
-                "score": score_val,
-                "is_mate": is_mate,
-                "best_move": best_move
+                "score": analysis_p2[0]["score"], # Deep eval
+                "best_move": analysis_p2[0]["best_move"],
+                "multipv": analysis_p1, # Top 3 from fast scan
+                "depth_used": adaptive_depth,
+                "cache_hit": cache_hit_p2,
+                "is_forcing": any(board.is_capture(m) or board.gives_check(m) for m in board.legal_moves)
             })
             
+    
     finally:
         await engine.quit()
         
