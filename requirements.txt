@@ -23,3 +23,4 @@ websockets==16.0
 sqlalchemy
 asyncpg
 psycopg2-binary
+aiosqlite
