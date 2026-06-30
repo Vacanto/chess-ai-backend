@@ -128,7 +128,7 @@ def _extract_analysis(info, board):
         })
     return lines
 
-async def analyze_position_async(engine, board: chess.Board, depth: int, multipv: int = 1):
+async def _analyze_position_internal(engine, board: chess.Board, depth: int, multipv: int = 1):
     fen = board.fen()
     cache_key = f"{fen}_{depth}_{multipv}"
     
@@ -150,6 +150,33 @@ async def analyze_position_async(engine, board: chess.Board, depth: int, multipv
     FEN_CACHE[cache_key] = res
     return res, False
 
+async def get_best_move_async(fen: str, time_limit: float = 0.5):
+    """
+    Public helper for single best move requests (used by routers/engine.py).
+    """
+    async with ENGINE_SEMAPHORE:
+        transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
+        try:
+            board = chess.Board(fen)
+            result = await engine.play(board, chess.engine.Limit(time=time_limit))
+            return result.move.uci() if result.move else None
+        finally:
+            await engine.quit()
+
+async def analyze_position_async(fen: str, time_limit: float = 0.5):
+    """
+    Public helper for single position analysis (used by routers/engine.py).
+    """
+    async with ENGINE_SEMAPHORE:
+        transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
+        try:
+            board = chess.Board(fen)
+            info = await engine.analyse(board, chess.engine.Limit(time=time_limit))
+            res = _extract_analysis(info, board)
+            return res[0] if res else None
+        finally:
+            await engine.quit()
+
 async def bulk_analyze_async(fens: list[str], debug: bool = False):
     async with ENGINE_SEMAPHORE:
         transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
@@ -163,7 +190,7 @@ async def bulk_analyze_async(fens: list[str], debug: bool = False):
                 # PASS 1
                 pass1_depth = 12
                 pass1_multipv = 3
-                analysis_p1, cache_hit_p1 = await analyze_position_async(engine, board, pass1_depth, pass1_multipv)
+                analysis_p1, cache_hit_p1 = await _analyze_position_internal(engine, board, pass1_depth, pass1_multipv)
                 
                 best_line = analysis_p1[0]
                 current_eval = best_line.get("score", 0)
@@ -178,7 +205,7 @@ async def bulk_analyze_async(fens: list[str], debug: bool = False):
                     adaptive_depth = pass1_depth
                 else:
                     adaptive_depth = await get_adaptive_depth(board)
-                    analysis_p2, cache_hit_p2 = await analyze_position_async(engine, board, adaptive_depth, multipv=1)
+                    analysis_p2, cache_hit_p2 = await _analyze_position_internal(engine, board, adaptive_depth, multipv=1)
                 
                 prev_eval = current_eval
 
