@@ -42,6 +42,7 @@ app.include_router(health.router)
 app.include_router(engine_router)
 app.include_router(games_router, prefix="/api/v1")
 app.include_router(analysis_router, prefix="/api/v1")
+app.include_router(ws_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
