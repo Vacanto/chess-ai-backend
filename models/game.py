@@ -11,5 +11,9 @@ class Game(Base):
     pgn = Column(Text, default="", nullable=False)
     status = Column(String, default="in_progress", nullable=False)
     
+    # Guest passcodes for multiplayer matchmaking
+    white_passcode = Column(String, nullable=True)
+    black_passcode = Column(String, nullable=True)
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

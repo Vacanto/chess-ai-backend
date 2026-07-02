@@ -42,3 +42,25 @@ def process_move(pgn_str: str, uci_move: str) -> Tuple[bool, str, str]:
     new_pgn_str = game.accept(exporter)
 
     return True, board.fen(), new_pgn_str
+
+
+def get_pgn_from_moves(moves: list[str]) -> str:
+    """
+    Reconstructs a PGN moves sequence string from a list of UCI moves.
+    """
+    game = chess.pgn.Game()
+    node = game
+    board = chess.Board()
+    for m in moves:
+        try:
+            move = chess.Move.from_uci(m)
+            if move in board.legal_moves:
+                node = node.add_main_variation(move)
+                board.push(move)
+            else:
+                break
+        except ValueError:
+            break
+            
+    exporter = chess.pgn.StringExporter(headers=False, variations=False, comments=False)
+    return game.accept(exporter)

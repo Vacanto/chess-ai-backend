@@ -16,10 +16,10 @@ from ws.game import router as ws_router
 async def lifespan(app: FastAPI):
     # Initialize the database and create tables
     async with engine.begin() as conn:
-        # Drop and recreate the analysis table to pick up new columns
-        # (analysis data is re-generatable, so this is safe)
-        # TODO: Remove this after the first successful deployment with new schema
+        # Drop and recreate tables to pick up new columns
+        # (safe for local development database resetting)
         await conn.run_sync(Analysis.__table__.drop, checkfirst=True)
+        await conn.run_sync(Game.__table__.drop, checkfirst=True)
         await conn.run_sync(Base.metadata.create_all)
     
     yield

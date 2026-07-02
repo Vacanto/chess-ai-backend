@@ -22,6 +22,8 @@ class GameResponse(BaseModel):
     black_player: Optional[str] = None
     pgn: str
     status: str
+    white_passcode: Optional[str] = None
+    black_passcode: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

@@ -2,6 +2,13 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Dict, List, Set, Optional
 import json
 import chess
+import io
+import chess.pgn
+
+from database.database import AsyncSessionLocal
+from models.game import Game
+from services.chess_logic import get_pgn_from_moves
+from sqlalchemy import select, update
 
 router = APIRouter()
 
@@ -19,50 +26,87 @@ class RoomManager:
         # }
         self.rooms: Dict[str, Dict] = {}
 
-    async def connect(self, room_id: str, websocket: WebSocket, username: Optional[str] = None):
+    async def connect(self, room_id: str, websocket: WebSocket, passcode: Optional[str] = None, username: Optional[str] = None):
         await websocket.accept()
+        
+        # 1. Database lookup for DB-backed game
+        db_game = None
+        try:
+            game_id = int(room_id)
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(Game).filter(Game.id == game_id))
+                db_game = result.scalars().first()
+        except ValueError:
+            pass # room_id is not a valid integer database ID
+            
+        # 2. Initialize room if not exists
         if room_id not in self.rooms:
+            # Reconstruct board state and history from DB PGN if available
+            board = chess.Board()
+            history = []
+            if db_game and db_game.pgn:
+                try:
+                    pgn_io = io.StringIO(db_game.pgn)
+                    parsed_game = chess.pgn.read_game(pgn_io)
+                    if parsed_game:
+                        temp_board = parsed_game.board()
+                        for move in parsed_game.mainline_moves():
+                            history.append(move.uci())
+                            temp_board.push(move)
+                        board = temp_board
+                except Exception as e:
+                    print(f"Error loading PGN from DB for room {room_id}: {e}")
+                    
             self.rooms[room_id] = {
                 "players": set(),
                 "white_player": None,
                 "white_username": None,
                 "black_player": None,
                 "black_username": None,
-                "board": chess.Board(),
-                "history": [],
+                "board": board,
+                "history": history,
                 "draw_offer_by": None
             }
         
         room = self.rooms[room_id]
         room["players"].add(websocket)
 
-        # Determine player role
+        # 3. Determine player role using passcodes (if DB-backed game)
         role = "spectator"
         
-        # If username is provided, match existing slot or claim an empty slot
-        if username:
-            if room["white_username"] == username:
+        if db_game:
+            if passcode == db_game.white_passcode:
                 room["white_player"] = websocket
+                room["white_username"] = username or db_game.white_player or "Guest (White)"
                 role = "white"
-            elif room["black_username"] == username:
+            elif passcode == db_game.black_passcode:
                 room["black_player"] = websocket
-                role = "black"
-            elif not room["white_player"] and not room["white_username"]:
-                room["white_player"] = websocket
-                room["white_username"] = username
-                role = "white"
-            elif not room["black_player"] and not room["black_username"]:
-                room["black_player"] = websocket
-                room["black_username"] = username
+                room["black_username"] = username or db_game.black_player or "Guest (Black)"
                 role = "black"
         else:
-            # Fallback to connection order if username is not provided
-            if not room["white_player"]:
-                room["white_player"] = websocket
-                role = "white"
-            elif not room["black_player"]:
-                room["black_player"] = websocket
-                role = "black"
+            # Fallback to connection order / username matching if not DB-backed
+            if username:
+                if room["white_username"] == username:
+                    room["white_player"] = websocket
+                    role = "white"
+                elif room["black_username"] == username:
+                    room["black_player"] = websocket
+                    role = "black"
+                elif not room["white_player"] and not room["white_username"]:
+                    room["white_player"] = websocket
+                    room["white_username"] = username
+                    role = "white"
+                elif not room["black_player"] and not room["black_username"]:
+                    room["black_player"] = websocket
+                    room["black_username"] = username
+                    role = "black"
+            else:
+                if not room["white_player"]:
+                    room["white_player"] = websocket
+                    role = "white"
+                elif not room["black_player"]:
+                    room["black_player"] = websocket
+                    role = "black"
 
         # Send initial state and assigned role
         await websocket.send_json({
@@ -76,11 +120,12 @@ class RoomManager:
         })
 
         # Broadcast status update to all in the room
+        display_name = username or ("Guest" if role != "spectator" else "Spectator")
         await self.broadcast(room_id, {
             "type": "status",
-            "message": f"Player '{username or 'Spectator'}' connected as {role}",
+            "message": f"Player '{display_name}' connected as {role}",
             "role": role,
-            "username": username,
+            "username": display_name,
             "online_players": {
                 "white": room["white_player"] is not None,
                 "black": room["black_player"] is not None
@@ -107,7 +152,7 @@ class RoomManager:
                 del self.rooms[room_id]
             else:
                 # Notify remaining players about disconnect
-                asyncio = __import__("asyncio")
+                import asyncio
                 loop = asyncio.get_event_loop()
                 loop.create_task(self.broadcast(room_id, {
                     "type": "status",
@@ -134,8 +179,13 @@ class RoomManager:
 manager = RoomManager()
 
 @router.websocket("/ws/game/{room_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, username: Optional[str] = None):
-    await manager.connect(room_id, websocket, username)
+async def websocket_endpoint(
+    websocket: WebSocket, 
+    room_id: str, 
+    passcode: Optional[str] = None, 
+    username: Optional[str] = None
+):
+    await manager.connect(room_id, websocket, passcode, username)
     try:
         while True:
             data = await websocket.receive_text()
@@ -203,6 +253,26 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: Optio
                                 "message": "Draw by fifty-move rule."
                             }
                             
+                        # Update DB if it is a database game
+                        try:
+                            game_id = int(room_id)
+                            new_pgn = get_pgn_from_moves(room["history"])
+                            async with AsyncSessionLocal() as session:
+                                update_values = {"pgn": new_pgn}
+                                if game_over_data:
+                                    update_values["status"] = "completed"
+                                    
+                                await session.execute(
+                                    update(Game)
+                                    .where(Game.id == game_id)
+                                    .values(**update_values)
+                                )
+                                await session.commit()
+                        except ValueError:
+                            pass # not a DB-backed game
+                        except Exception as e:
+                            print(f"Failed to save move to DB: {e}")
+                            
                         # Broadcast move
                         await manager.broadcast(room_id, {
                             "type": "move",
@@ -225,6 +295,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: Optio
                     await websocket.send_json({"type": "error", "message": "Spectators cannot resign"})
                     continue
                 winner = "black" if role == "white" else "white"
+                
+                try:
+                    game_id = int(room_id)
+                    async with AsyncSessionLocal() as session:
+                        await session.execute(update(Game).where(Game.id == game_id).values(status="completed"))
+                        await session.commit()
+                except ValueError:
+                    pass
+                except Exception as e:
+                    print(f"Failed to update resignation status in DB: {e}")
+
                 await manager.broadcast(room_id, {
                     "type": "game_over",
                     "reason": "resignation",
@@ -260,6 +341,16 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: Optio
                 room["draw_offer_by"] = None
                 
                 if accepted:
+                    try:
+                        game_id = int(room_id)
+                        async with AsyncSessionLocal() as session:
+                            await session.execute(update(Game).where(Game.id == game_id).values(status="completed"))
+                            await session.commit()
+                    except ValueError:
+                        pass
+                    except Exception as e:
+                        print(f"Failed to update draw status in DB: {e}")
+
                     await manager.broadcast(room_id, {
                         "type": "game_over",
                         "reason": "draw_agreement",
@@ -288,4 +379,3 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, username: Optio
     except Exception as e:
         print(f"WS error: {e}")
         manager.disconnect(room_id, websocket)
-

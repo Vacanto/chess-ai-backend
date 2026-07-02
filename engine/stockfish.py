@@ -173,15 +173,19 @@ async def _analyze_position_internal(engine, board: chess.Board, depth: int, mul
     FEN_CACHE[cache_key] = res
     return res, False
 
-async def get_best_move_async(fen: str, time_limit: float = 0.5):
+async def get_best_move_async(fen: str, time_limit: float = 0.5, skill_level: int = 20, depth: int = None):
     """
     Public helper for single best move requests (used by routers/engine.py).
     """
     async with ENGINE_SEMAPHORE:
         transport, engine = await chess.engine.popen_uci(STOCKFISH_PATH)
         try:
+            # Configure skill level
+            await engine.configure({"Skill Level": skill_level})
+            
             board = chess.Board(fen)
-            result = await engine.play(board, chess.engine.Limit(time=time_limit))
+            limit = chess.engine.Limit(time=time_limit, depth=depth)
+            result = await engine.play(board, limit)
             return result.move.uci() if result.move else None
         finally:
             await engine.quit()

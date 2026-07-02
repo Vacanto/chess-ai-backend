@@ -9,6 +9,8 @@ from services.chess_logic import process_move
 
 router = APIRouter(prefix="/games", tags=["Games"])
 
+import secrets
+
 @router.post("/", response_model=GameResponse, status_code=status.HTTP_201_CREATED)
 async def start_game(game_in: GameCreate, db: AsyncSession = Depends(get_db)):
     """Start a new chess game."""
@@ -16,7 +18,9 @@ async def start_game(game_in: GameCreate, db: AsyncSession = Depends(get_db)):
         white_player=game_in.white_player,
         black_player=game_in.black_player,
         pgn="",
-        status="in_progress"
+        status="in_progress",
+        white_passcode=secrets.token_hex(4),
+        black_passcode=secrets.token_hex(4)
     )
     db.add(new_game)
     await db.commit()
