@@ -9,8 +9,16 @@ from pydantic import BaseModel
 from database.database import get_db
 from models.game import Game
 from models.analysis import Analysis
-from schemas.analysis import GameAnalysisHistory, AnalysisResponse, AnalysisSummary
-from engine.stockfish import bulk_analyze_async
+from schemas.analysis import (
+    GameAnalysisHistory, 
+    AnalysisResponse, 
+    AnalysisSummary,
+    GameReviewResponse,
+    ReviewStep,
+    ReviewGuessRequest,
+    ReviewGuessResponse
+)
+from engine.stockfish import bulk_analyze_async, analyze_position_async
 from services.openings import detect_opening, is_book_move
 
 router = APIRouter(prefix="/analysis", tags=["Game Analysis"])
@@ -531,4 +539,171 @@ async def get_game_analysis(game_id: int, db: AsyncSession = Depends(get_db)):
         summary=summary,
         opening_name=opening_name,
         opening_eco=opening_eco
+    )
+
+
+@router.get("/{game_id}/review", response_model=GameReviewResponse)
+async def get_game_review(game_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Retrieves mistake positions from the database analysis in chronological order.
+    """
+    # 1. Fetch analysis records ordered by ply
+    result = await db.execute(
+        select(Analysis).filter(Analysis.game_id == game_id).order_by(Analysis.ply.asc())
+    )
+    records = result.scalars().all()
+    
+    if not records:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Analysis not found for this game. Please run analysis first."
+        )
+        
+    steps = []
+    # Loop over plies to find mistakes (ply > 0)
+    for r in records:
+        if r.ply == 0:
+            continue
+            
+        if r.classification in ("Blunder", "Mistake", "Inaccuracy"):
+            # The position before the mistake was at ply - 1
+            prev_record = next((prev for prev in records if prev.ply == r.ply - 1), None)
+            if not prev_record:
+                continue
+                
+            player_color = "white" if r.ply % 2 == 1 else "black"
+            steps.append(ReviewStep(
+                ply=r.ply,
+                fen_before=prev_record.fen,
+                move_played=r.move_played,
+                classification=r.classification,
+                best_move=r.best_move,
+                best_move_score=r.best_move_eval if r.best_move_eval is not None else r.score,
+                played_move_score=r.played_move_eval if r.played_move_eval is not None else r.score,
+                player_color=player_color
+            ))
+            
+    return GameReviewResponse(game_id=game_id, steps=steps)
+
+
+@router.post("/{game_id}/review/guess", response_model=ReviewGuessResponse)
+async def guess_review_move(
+    game_id: int,
+    req: ReviewGuessRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Validates a player's guessed move for a mistake position.
+    If correct or close to best move (<= 50 CP loss), returns success.
+    """
+    # 1. Load the analysis record for the mistake ply
+    result = await db.execute(
+        select(Analysis)
+        .filter(Analysis.game_id == game_id, Analysis.ply == req.ply)
+    )
+    record = result.scalars().first()
+    
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis record not found for ply {req.ply}."
+        )
+        
+    if record.classification not in ("Blunder", "Mistake", "Inaccuracy"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Ply {req.ply} was not classified as a mistake in the game."
+        )
+        
+    # 2. Get the position before the move (from ply - 1)
+    prev_result = await db.execute(
+        select(Analysis)
+        .filter(Analysis.game_id == game_id, Analysis.ply == req.ply - 1)
+    )
+    prev_record = prev_result.scalars().first()
+    
+    if not prev_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Preceding position not found for ply {req.ply - 1}."
+        )
+        
+    # 3. Validate user's guess legality in the preceding position
+    board = chess.Board(prev_record.fen)
+    try:
+        move = chess.Move.from_uci(req.guess_move)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid move format: {req.guess_move}"
+        )
+        
+    if move not in board.legal_moves:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Guessed move {req.guess_move} is illegal in this position."
+        )
+        
+    # 4. If guess matches the best move directly, it's correct!
+    best_move_val = record.best_move
+    best_move_score = record.best_move_eval if record.best_move_eval is not None else record.score
+    
+    if req.guess_move == best_move_val:
+        return ReviewGuessResponse(
+            correct=True,
+            guessed_move_score=best_move_score,
+            best_move_score=best_move_score,
+            difference=0,
+            classification="Best",
+            message="Correct! You found the best move."
+        )
+        
+    # 5. Evaluate the guessed move on the fly using Stockfish
+    board.push(move)
+    analysis = await analyze_position_async(board.fen(), time_limit=0.15)
+    if not analysis:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to evaluate guess with Stockfish."
+        )
+        
+    guessed_move_score = analysis["score"]
+    
+    # Compute centipawn loss of guess compared to the best move
+    white_moved = (req.ply % 2 == 1)
+    loss = _compute_cp_loss(best_move_score, guessed_move_score, white_moved)
+    
+    # Classify the guess quality
+    if loss <= 0:
+        correct = True
+        classification = "Best"
+        message = "Correct! You found the best move."
+    elif loss <= 30:
+        correct = True
+        classification = "Excellent"
+        message = "Excellent move! That is also correct."
+    elif loss <= 50:
+        correct = True
+        classification = "Good"
+        message = "Good move! That is also acceptable."
+    elif loss <= 100:
+        correct = False
+        classification = "Inaccuracy"
+        message = "Incorrect. That move is an inaccuracy."
+    elif loss <= 300:
+        correct = False
+        classification = "Mistake"
+        message = "Incorrect. That move is a mistake."
+    else:
+        correct = False
+        classification = "Blunder"
+        message = "Incorrect. That move is a blunder!"
+        
+    return ReviewGuessResponse(
+        correct=correct,
+        guessed_move_score=guessed_move_score,
+        best_move_score=best_move_score,
+        difference=loss,
+        classification=classification,
+        message=message
     )

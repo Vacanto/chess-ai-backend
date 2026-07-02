@@ -54,3 +54,33 @@ class GameAnalysisHistory(BaseModel):
     summary: Optional[AnalysisSummary] = None
     opening_name: Optional[str] = None
     opening_eco: Optional[str] = None
+
+
+class ReviewStep(BaseModel):
+    ply: int
+    fen_before: str
+    move_played: str
+    classification: str
+    best_move: str
+    best_move_score: int
+    played_move_score: int
+    player_color: str
+
+
+class GameReviewResponse(BaseModel):
+    game_id: int
+    steps: List[ReviewStep]
+
+
+class ReviewGuessRequest(BaseModel):
+    ply: int
+    guess_move: str
+
+
+class ReviewGuessResponse(BaseModel):
+    correct: bool
+    guessed_move_score: int
+    best_move_score: int
+    difference: int
+    classification: str
+    message: str
