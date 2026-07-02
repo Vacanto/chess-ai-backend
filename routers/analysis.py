@@ -9,8 +9,9 @@ from pydantic import BaseModel
 from database.database import get_db
 from models.game import Game
 from models.analysis import Analysis
-from schemas.analysis import GameAnalysisHistory, AnalysisResponse
+from schemas.analysis import GameAnalysisHistory, AnalysisResponse, AnalysisSummary
 from engine.stockfish import bulk_analyze_async
+from services.openings import detect_opening, is_book_move
 
 router = APIRouter(prefix="/analysis", tags=["Game Analysis"])
 
@@ -27,6 +28,37 @@ def get_material_value(board: chess.Board) -> int:
         val -= len(board.pieces(pt, chess.BLACK)) * v
     return val
 
+CLASSIFICATION_SYMBOLS = {
+    "Brilliant": "!!",
+    "Great Move": "!",
+    "Best": "",
+    "Excellent": "",
+    "Good": "",
+    "Book": "📖",
+    "Inaccuracy": "?!",
+    "Mistake": "?",
+    "Blunder": "??",
+    "Forced": "",
+}
+
+def format_score(score: int, is_mate: bool) -> str:
+    """Formats the centipawn score into a human-readable string (e.g. +1.50, -0.20, #M3)."""
+    if is_mate:
+        mate_dist = round((30000 - abs(score)) / 100)
+        mate_in = max(1, mate_dist)
+        if score > 0:
+            return f"#M{mate_in}"
+        else:
+            return f"#-M{mate_in}"
+    else:
+        pawns = score / 100.0
+        if pawns > 0:
+            return f"+{pawns:.2f}"
+        elif pawns < 0:
+            return f"{pawns:.2f}"
+        else:
+            return "0.00"
+
 def classify_move(
     cp_loss: int, 
     played_move: str,
@@ -34,11 +66,18 @@ def classify_move(
     second_best_line: dict = None,
     material_before: int = 0,
     material_after: int = 0,
-    white_moved: bool = True
+    white_moved: bool = True,
+    is_forced: bool = False,
+    is_book: bool = False
 ) -> str:
     """
     Advanced move classification logic.
     """
+    if is_forced:
+        return "Forced"
+    if is_book:
+        return "Book"
+
     best_move = best_line.get("best_move")
     is_best_move = (played_move == best_move)
     best_eval = best_line["score"]
@@ -88,11 +127,149 @@ def _compute_cp_loss(best_eval: int, played_eval: int, white_moved: bool) -> int
 
 
 import math
-from schemas.analysis import AnalysisSummary
 
 def get_accuracy(cp_loss: int) -> float:
     """exp(-0.035 * cp_loss) * 100"""
     return max(0.0, min(100.0, math.exp(-0.035 * cp_loss) * 100.0))
+
+@router.post("/pgn", response_model=GameAnalysisHistory)
+async def analyze_pgn(req: PGNAnalysisRequest, debug: bool = False):
+    """
+    Parses a PGN string natively and returns step-by-step analysis without saving to the DB.
+    """
+    if not req.pgn:
+        raise HTTPException(status_code=400, detail="Empty PGN provided.")
+        
+    pgn_io = io.StringIO(req.pgn)
+    chess_game = chess.pgn.read_game(pgn_io)
+    if not chess_game:
+        raise HTTPException(status_code=400, detail="Invalid PGN string.")
+        
+    board = chess_game.board()
+    fens = [board.fen()]
+    moves_played = [None]
+    move_colors = [None]
+    material_history = [get_material_value(board)]
+    is_forced_list = [False]
+    
+    for move in chess_game.mainline_moves():
+        is_forced_list.append(board.legal_moves.count() == 1)
+        move_colors.append("white" if board.turn == chess.WHITE else "black")
+        moves_played.append(move.uci())
+        board.push(move)
+        fens.append(board.fen())
+        material_history.append(get_material_value(board))
+        
+    try:
+        evals = await bulk_analyze_async(fens)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stockfish engine error: {e}")
+
+    processed_evals = []
+    stats = {
+        "white": {"acc": [], "weight": [], "cp_loss": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0},
+        "black": {"acc": [], "weight": [], "cp_loss": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0}
+    }
+
+    # Format starter score
+    init_score = evals[0]["score"]
+    init_mate = abs(init_score) >= 25000
+    init_fmt_score = format_score(init_score, init_mate)
+
+    processed_evals.append(AnalysisResponse(
+        id=0, game_id=0, ply=0, fen=evals[0]["fen"],
+        score=init_score, is_mate=init_mate,
+        best_move=evals[0]["best_move"], move_played=None, classification=None,
+        accuracy=100.0, depth_used=evals[0]["depth_used"], cache_hit=evals[0]["cache_hit"],
+        symbol=None, pv=None, formatted_score=init_fmt_score
+    ))
+
+    for i in range(1, len(evals)):
+        white_moved = (move_colors[i] == "white")
+        side_key = "white" if white_moved else "black"
+        
+        best_line = evals[i - 1]["multipv"][0]
+        second_best_line = evals[i - 1]["multipv"][1] if len(evals[i - 1]["multipv"]) > 1 else None
+        
+        played_eval = evals[i]["score"]
+        best_eval = best_line["score"]
+        
+        cp_loss = _compute_cp_loss(best_eval, played_eval, white_moved)
+        
+        # Check Book and Forced move status
+        is_book = is_book_move(moves_played[1:i+1])
+        is_forced = is_forced_list[i]
+        
+        classification = classify_move(
+            cp_loss, moves_played[i], best_line, second_best_line,
+            material_history[i-1], material_history[i], white_moved,
+            is_forced=is_forced, is_book=is_book
+        )
+        
+        if classification in ("Book", "Forced"):
+            cp_loss = 0
+            acc = 100.0
+        else:
+            acc = get_accuracy(cp_loss)
+        
+        weight = 1.0
+        if i < 10: weight = 0.5
+        elif cp_loss > 100: weight = 1.5
+        
+        stats[side_key]["acc"].append(acc)
+        stats[side_key]["weight"].append(weight)
+        stats[side_key]["cp_loss"].append(cp_loss)
+        
+        if classification == "Blunder": stats[side_key]["blunders"] += 1
+        elif classification == "Mistake": stats[side_key]["mistakes"] += 1
+        elif classification == "Inaccuracy": stats[side_key]["inaccuracies"] += 1
+        elif classification == "Great Move": stats[side_key]["great"] += 1
+        elif classification == "Brilliant": stats[side_key]["brilliant"] += 1
+
+        pv_str = " ".join(best_line.get("pv", [])) if best_line.get("pv") else None
+        is_mate = abs(played_eval) >= 25000
+        fmt_score = format_score(played_eval, is_mate)
+        symbol = CLASSIFICATION_SYMBOLS.get(classification)
+
+        processed_evals.append(AnalysisResponse(
+            id=i, game_id=0, ply=i, fen=evals[i]["fen"],
+            score=played_eval, is_mate=is_mate,
+            best_move=evals[i - 1]["best_move"], move_played=moves_played[i],
+            classification=classification, accuracy=acc,
+            best_move_eval=best_eval, played_move_eval=played_eval, cp_loss=cp_loss,
+            depth_used=evals[i]["depth_used"], cache_hit=evals[i]["cache_hit"],
+            multipv_lines=evals[i-1]["multipv"] if debug else None,
+            pv=pv_str, symbol=symbol, formatted_score=fmt_score
+        ))
+
+    def weighted_avg(side):
+        if not stats[side]["acc"]: return 0.0
+        total_w = sum(stats[side]["weight"])
+        if total_w == 0: return 0.0
+        return sum(a * w for a, w in zip(stats[side]["acc"], stats[side]["weight"])) / total_w
+
+    acpl_white = sum(stats["white"]["cp_loss"]) / len(stats["white"]["cp_loss"]) if stats["white"]["cp_loss"] else 0.0
+    acpl_black = sum(stats["black"]["cp_loss"]) / len(stats["black"]["cp_loss"]) if stats["black"]["cp_loss"] else 0.0
+
+    summary = AnalysisSummary(
+        accuracy_white=weighted_avg("white"), accuracy_black=weighted_avg("black"),
+        blunders_white=stats["white"]["blunders"], blunders_black=stats["black"]["blunders"],
+        mistakes_white=stats["white"]["mistakes"], mistakes_black=stats["black"]["mistakes"],
+        inaccuracies_white=stats["white"]["inaccuracies"], inaccuracies_black=stats["black"]["inaccuracies"],
+        great_moves_white=stats["white"]["great"], great_moves_black=stats["black"]["great"],
+        brilliant_moves_white=stats["white"]["brilliant"], brilliant_moves_black=stats["black"]["brilliant"],
+        acpl_white=acpl_white, acpl_black=acpl_black
+    )
+
+    opening_name, opening_eco = detect_opening(fens)
+    
+    return GameAnalysisHistory(
+        game_id=0,
+        evaluations=processed_evals,
+        summary=summary,
+        opening_name=opening_name,
+        opening_eco=opening_eco
+    )
 
 @router.post("/{game_id}", response_model=GameAnalysisHistory)
 async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSession = Depends(get_db)):
@@ -120,8 +297,12 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
     moves_played = [None]
     move_colors = [None]
     material_history = [get_material_value(board)]
+    is_forced_list = [False]
     
     for move in chess_game.mainline_moves():
+        # Check if the move is forced BEFORE pushing it to the board
+        is_forced_list.append(board.legal_moves.count() == 1)
+        
         move_colors.append("white" if board.turn == chess.WHITE else "black")
         moves_played.append(move.uci())
         board.push(move)
@@ -138,16 +319,22 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
     
     # Stats counters
     stats = {
-        "white": {"acc": [], "weight": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0},
-        "black": {"acc": [], "weight": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0}
+        "white": {"acc": [], "weight": [], "cp_loss": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0},
+        "black": {"acc": [], "weight": [], "cp_loss": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0}
     }
+
+    # Format starter score
+    init_score = evals[0]["score"]
+    init_mate = abs(init_score) >= 25000
+    init_fmt_score = format_score(init_score, init_mate)
 
     # ply 0 is starting position (no move)
     processed_evals.append(AnalysisResponse(
         id=0, game_id=game.id, ply=0, fen=evals[0]["fen"],
-        score=evals[0]["score"], is_mate=abs(evals[0]["score"]) >= 25000,
+        score=init_score, is_mate=init_mate,
         best_move=evals[0]["best_move"], move_played=None, classification=None,
-        accuracy=100.0, depth_used=evals[0]["depth_used"], cache_hit=evals[0]["cache_hit"]
+        accuracy=100.0, depth_used=evals[0]["depth_used"], cache_hit=evals[0]["cache_hit"],
+        symbol=None, pv=None, formatted_score=init_fmt_score
     ))
 
     for i in range(1, len(evals)):
@@ -163,7 +350,23 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
         best_eval = best_line["score"]
         
         cp_loss = _compute_cp_loss(best_eval, played_eval, white_moved)
-        acc = get_accuracy(cp_loss)
+        
+        # Check Book and Forced move status
+        is_book = is_book_move(moves_played[1:i+1])
+        is_forced = is_forced_list[i]
+        
+        classification = classify_move(
+            cp_loss, moves_played[i], best_line, second_best_line,
+            material_history[i-1], material_history[i], white_moved,
+            is_forced=is_forced, is_book=is_book
+        )
+        
+        # Override loss & accuracy for Book and Forced moves
+        if classification in ("Book", "Forced"):
+            cp_loss = 0
+            acc = 100.0
+        else:
+            acc = get_accuracy(cp_loss)
         
         # Weighted accuracy logic
         weight = 1.0
@@ -172,11 +375,7 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
         
         stats[side_key]["acc"].append(acc)
         stats[side_key]["weight"].append(weight)
-        
-        classification = classify_move(
-            cp_loss, moves_played[i], best_line, second_best_line,
-            material_history[i-1], material_history[i], white_moved
-        )
+        stats[side_key]["cp_loss"].append(cp_loss)
         
         # Update counters
         if classification == "Blunder": stats[side_key]["blunders"] += 1
@@ -185,22 +384,36 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
         elif classification == "Great Move": stats[side_key]["great"] += 1
         elif classification == "Brilliant": stats[side_key]["brilliant"] += 1
 
+        # PV line (best continuation)
+        pv_str = " ".join(best_line.get("pv", [])) if best_line.get("pv") else None
+        
+        # Formatted score
+        is_mate = abs(played_eval) >= 25000
+        fmt_score = format_score(played_eval, is_mate)
+        
+        # Symbol
+        symbol = CLASSIFICATION_SYMBOLS.get(classification)
+
         processed_evals.append(AnalysisResponse(
             id=i, game_id=game.id, ply=i, fen=evals[i]["fen"],
-            score=evals[i]["score"], is_mate=abs(evals[i]["score"]) >= 25000,
+            score=played_eval, is_mate=is_mate,
             best_move=evals[i - 1]["best_move"], move_played=moves_played[i],
             classification=classification, accuracy=acc,
             best_move_eval=best_eval, played_move_eval=played_eval, cp_loss=cp_loss,
             depth_used=evals[i]["depth_used"], cache_hit=evals[i]["cache_hit"],
-            multipv_lines=evals[i-1]["multipv"] if debug else None
+            multipv_lines=evals[i-1]["multipv"] if debug else None,
+            pv=pv_str, symbol=symbol, formatted_score=fmt_score
         ))
 
-    # Compute final weighted accuracies
+    # Compute final weighted accuracies and ACPL
     def weighted_avg(side):
         if not stats[side]["acc"]: return 0.0
         total_w = sum(stats[side]["weight"])
         if total_w == 0: return 0.0
         return sum(a * w for a, w in zip(stats[side]["acc"], stats[side]["weight"])) / total_w
+
+    acpl_white = sum(stats["white"]["cp_loss"]) / len(stats["white"]["cp_loss"]) if stats["white"]["cp_loss"] else 0.0
+    acpl_black = sum(stats["black"]["cp_loss"]) / len(stats["black"]["cp_loss"]) if stats["black"]["cp_loss"] else 0.0
 
     summary = AnalysisSummary(
         accuracy_white=weighted_avg("white"), accuracy_black=weighted_avg("black"),
@@ -208,8 +421,12 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
         mistakes_white=stats["white"]["mistakes"], mistakes_black=stats["black"]["mistakes"],
         inaccuracies_white=stats["white"]["inaccuracies"], inaccuracies_black=stats["black"]["inaccuracies"],
         great_moves_white=stats["white"]["great"], great_moves_black=stats["black"]["great"],
-        brilliant_moves_white=stats["white"]["brilliant"], brilliant_moves_black=stats["black"]["brilliant"]
+        brilliant_moves_white=stats["white"]["brilliant"], brilliant_moves_black=stats["black"]["brilliant"],
+        acpl_white=acpl_white, acpl_black=acpl_black
     )
+
+    # Detect opening
+    opening_name, opening_eco = detect_opening(fens)
 
     # Persistence (idempotent)
     await db.execute(Analysis.__table__.delete().where(Analysis.game_id == game.id))
@@ -219,110 +436,18 @@ async def generate_game_analysis(game_id: int, debug: bool = False, db: AsyncSes
             is_mate=res.is_mate, best_move=res.best_move, move_played=res.move_played,
             classification=res.classification, accuracy=int(res.accuracy),
             cp_loss=res.cp_loss, best_move_eval=res.best_move_eval,
-            played_move_eval=res.played_move_eval, depth_used=res.depth_used
+            played_move_eval=res.played_move_eval, depth_used=res.depth_used,
+            pv=res.pv, symbol=res.symbol, formatted_score=res.formatted_score
         ))
     await db.commit()
     
-    return GameAnalysisHistory(game_id=game.id, evaluations=processed_evals, summary=summary)
-
-@router.post("/pgn", response_model=GameAnalysisHistory)
-async def analyze_pgn(req: PGNAnalysisRequest, debug: bool = False):
-    """
-    Parses a PGN string natively and returns step-by-step analysis without saving to the DB.
-    """
-    if not req.pgn:
-        raise HTTPException(status_code=400, detail="Empty PGN provided.")
-        
-    pgn_io = io.StringIO(req.pgn)
-    chess_game = chess.pgn.read_game(pgn_io)
-    if not chess_game:
-        raise HTTPException(status_code=400, detail="Invalid PGN string.")
-        
-    board = chess_game.board()
-    fens = [board.fen()]
-    moves_played = [None]
-    move_colors = [None]
-    material_history = [get_material_value(board)]
-    
-    for move in chess_game.mainline_moves():
-        move_colors.append("white" if board.turn == chess.WHITE else "black")
-        moves_played.append(move.uci())
-        board.push(move)
-        fens.append(board.fen())
-        material_history.append(get_material_value(board))
-        
-    try:
-        evals = await bulk_analyze_async(fens)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stockfish engine error: {e}")
-
-    processed_evals = []
-    stats = {
-        "white": {"acc": [], "weight": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0},
-        "black": {"acc": [], "weight": [], "blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0}
-    }
-
-    processed_evals.append(AnalysisResponse(
-        id=0, game_id=0, ply=0, fen=evals[0]["fen"],
-        score=evals[0]["score"], is_mate=abs(evals[0]["score"]) >= 25000,
-        best_move=evals[0]["best_move"], move_played=None, classification=None,
-        accuracy=100.0, depth_used=evals[0]["depth_used"], cache_hit=evals[0]["cache_hit"]
-    ))
-
-    for i in range(1, len(evals)):
-        white_moved = (move_colors[i] == "white")
-        side_key = "white" if white_moved else "black"
-        best_line = evals[i - 1]["multipv"][0]
-        second_best_line = evals[i - 1]["multipv"][1] if len(evals[i - 1]["multipv"]) > 1 else None
-        played_eval = evals[i]["score"]
-        best_eval = best_line["score"]
-        cp_loss = _compute_cp_loss(best_eval, played_eval, white_moved)
-        acc = get_accuracy(cp_loss)
-        
-        weight = 1.0
-        if i < 10: weight = 0.5
-        elif cp_loss > 100: weight = 1.5
-        
-        stats[side_key]["acc"].append(acc)
-        stats[side_key]["weight"].append(weight)
-        
-        classification = classify_move(
-            cp_loss, moves_played[i], best_line, second_best_line,
-            material_history[i-1], material_history[i], white_moved
-        )
-        
-        if classification == "Blunder": stats[side_key]["blunders"] += 1
-        elif classification == "Mistake": stats[side_key]["mistakes"] += 1
-        elif classification == "Inaccuracy": stats[side_key]["inaccuracies"] += 1
-        elif classification == "Great Move": stats[side_key]["great"] += 1
-        elif classification == "Brilliant": stats[side_key]["brilliant"] += 1
-
-        processed_evals.append(AnalysisResponse(
-            id=i, game_id=0, ply=i, fen=evals[i]["fen"],
-            score=evals[i]["score"], is_mate=abs(evals[i]["score"]) >= 25000,
-            best_move=evals[i - 1]["best_move"], move_played=moves_played[i],
-            classification=classification.capitalize(), accuracy=acc,
-            best_move_eval=best_eval, played_move_eval=played_eval, cp_loss=cp_loss,
-            depth_used=evals[i]["depth_used"], cache_hit=evals[i]["cache_hit"],
-            multipv_lines=evals[i-1]["multipv"] if debug else None
-        ))
-
-    def weighted_avg(side):
-        if not stats[side]["acc"]: return 0.0
-        total_w = sum(stats[side]["weight"])
-        if total_w == 0: return 0.0
-        return sum(a * w for a, w in zip(stats[side]["acc"], stats[side]["weight"])) / total_w
-
-    summary = AnalysisSummary(
-        accuracy_white=weighted_avg("white"), accuracy_black=weighted_avg("black"),
-        blunders_white=stats["white"]["blunders"], blunders_black=stats["black"]["blunders"],
-        mistakes_white=stats["white"]["mistakes"], mistakes_black=stats["black"]["mistakes"],
-        inaccuracies_white=stats["white"]["inaccuracies"], inaccuracies_black=stats["black"]["inaccuracies"],
-        great_moves_white=stats["white"]["great"], great_moves_black=stats["black"]["great"],
-        brilliant_moves_white=stats["white"]["brilliant"], brilliant_moves_black=stats["black"]["brilliant"]
+    return GameAnalysisHistory(
+        game_id=game.id,
+        evaluations=processed_evals,
+        summary=summary,
+        opening_name=opening_name,
+        opening_eco=opening_eco
     )
-    
-    return GameAnalysisHistory(game_id=0, evaluations=processed_evals, summary=summary)
 
 @router.get("/{game_id}", response_model=GameAnalysisHistory)
 async def get_game_analysis(game_id: int, db: AsyncSession = Depends(get_db)):
@@ -337,4 +462,73 @@ async def get_game_analysis(game_id: int, db: AsyncSession = Depends(get_db)):
     if not records:
         raise HTTPException(status_code=404, detail="Analysis not found for this game. Please hit the POST endpoint first.")
         
-    return GameAnalysisHistory(game_id=game_id, evaluations=records)
+    # Compute summary dynamically
+    white_records = [r for r in records if r.ply % 2 == 1]
+    black_records = [r for r in records if r.ply % 2 == 0 and r.ply > 0]
+    
+    stats = {
+        "white": {"blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0},
+        "black": {"blunders": 0, "mistakes": 0, "inaccuracies": 0, "great": 0, "brilliant": 0}
+    }
+    
+    for r in records:
+        if r.ply == 0:
+            continue
+        side_key = "white" if r.ply % 2 == 1 else "black"
+        if r.classification == "Blunder": stats[side_key]["blunders"] += 1
+        elif r.classification == "Mistake": stats[side_key]["mistakes"] += 1
+        elif r.classification == "Inaccuracy": stats[side_key]["inaccuracies"] += 1
+        elif r.classification == "Great Move": stats[side_key]["great"] += 1
+        elif r.classification == "Brilliant": stats[side_key]["brilliant"] += 1
+        
+    def weighted_avg(records_list):
+        if not records_list:
+            return 0.0
+        total_w = 0.0
+        weighted_sum = 0.0
+        for r in records_list:
+            weight = 1.0
+            if r.ply < 10:
+                weight = 0.5
+            elif r.cp_loss is not None and r.cp_loss > 100:
+                weight = 1.5
+            weighted_sum += r.accuracy * weight
+            total_w += weight
+        return weighted_sum / total_w if total_w > 0 else 0.0
+        
+    acpl_white = sum(r.cp_loss for r in white_records if r.cp_loss is not None) / len(white_records) if white_records else 0.0
+    acpl_black = sum(r.cp_loss for r in black_records if r.cp_loss is not None) / len(black_records) if black_records else 0.0
+    
+    summary = AnalysisSummary(
+        accuracy_white=weighted_avg(white_records),
+        accuracy_black=weighted_avg(black_records),
+        blunders_white=stats["white"]["blunders"],
+        blunders_black=stats["black"]["blunders"],
+        mistakes_white=stats["white"]["mistakes"],
+        mistakes_black=stats["black"]["mistakes"],
+        inaccuracies_white=stats["white"]["inaccuracies"],
+        inaccuracies_black=stats["black"]["inaccuracies"],
+        great_moves_white=stats["white"]["great"],
+        great_moves_black=stats["black"]["great"],
+        brilliant_moves_white=stats["white"]["brilliant"],
+        brilliant_moves_black=stats["black"]["brilliant"],
+        acpl_white=acpl_white,
+        acpl_black=acpl_black
+    )
+    
+    # Detect opening
+    fens = [r.fen for r in records]
+    opening_name, opening_eco = detect_opening(fens)
+    
+    # Map to schema output
+    evaluations_response = []
+    for r in records:
+        evaluations_response.append(AnalysisResponse.model_validate(r))
+        
+    return GameAnalysisHistory(
+        game_id=game_id,
+        evaluations=evaluations_response,
+        summary=summary,
+        opening_name=opening_name,
+        opening_eco=opening_eco
+    )

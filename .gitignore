@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .env
 stockfish
+stockfish.exe
+sf.zip
 *.db

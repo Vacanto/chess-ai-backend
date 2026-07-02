@@ -23,8 +23,31 @@ if os.name == 'nt' and not STOCKFISH_PATH.endswith('.exe'):
 def setup_stockfish():
     global STOCKFISH_PATH
     
-    # On Windows, just return the path (assuming local exe is fine)
+    # On Windows, verify if the local exe exists; if not, download the official release
     if os.name == 'nt':
+        exe_path = STOCKFISH_PATH if STOCKFISH_PATH.endswith('.exe') else STOCKFISH_PATH + ".exe"
+        if os.path.exists(exe_path):
+            STOCKFISH_PATH = exe_path
+            return STOCKFISH_PATH
+            
+        print("Stockfish not found on Windows. Downloading Windows build...")
+        url = "https://github.com/official-stockfish/Stockfish/releases/download/sf_17/stockfish-windows-x86-64-avx2.zip"
+        zip_path = os.path.join(BASE_DIR, "sf.zip")
+        try:
+            import zipfile
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for member in zip_ref.namelist():
+                    if member.endswith(".exe") and "stockfish" in member.lower():
+                        with zip_ref.open(member) as source, open(exe_path, "wb") as target:
+                            shutil.copyfileobj(source, target)
+                        break
+            os.remove(zip_path)
+            STOCKFISH_PATH = exe_path
+            print(f"Downloaded and extracted Stockfish to: {exe_path}")
+        except Exception as e:
+            print(f"Failed to download stockfish fallback for Windows: {e}")
+            
         return STOCKFISH_PATH
         
     # We want a path where we have full permissions
@@ -111,7 +134,7 @@ def normalize_score(score, board_turn):
         
         cp = MATE_SCORE - abs(mate_in) * 100
         return cp if mate_in > 0 else -cp
-    return sc.score(default=0)
+    return sc.score() if sc.score() is not None else 0
 
 def _extract_analysis(info, board):
     if not isinstance(info, list):

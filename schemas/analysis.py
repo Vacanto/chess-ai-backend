@@ -16,6 +16,9 @@ class AnalysisSummary(BaseModel):
     great_moves_black: int
     brilliant_moves_white: int
     brilliant_moves_black: int
+    # Lichess-style additions
+    acpl_white: float
+    acpl_black: float
 
 class AnalysisResponse(BaseModel):
     id: int
@@ -37,6 +40,11 @@ class AnalysisResponse(BaseModel):
     cache_hit: bool = False
     multipv_lines: Optional[List[Any]] = None
     
+    # New Lichess-style fields
+    pv: Optional[str] = None
+    symbol: Optional[str] = None
+    formatted_score: Optional[str] = None
+    
     created_at: Optional[datetime] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -44,3 +52,5 @@ class GameAnalysisHistory(BaseModel):
     game_id: int
     evaluations: List[AnalysisResponse]
     summary: Optional[AnalysisSummary] = None
+    opening_name: Optional[str] = None
+    opening_eco: Optional[str] = None

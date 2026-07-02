@@ -21,4 +21,9 @@ class Analysis(Base):
     move_played = Column(String, nullable=True) # The actual UCI move that was played (None for starting position)
     classification = Column(String, nullable=True) # Move quality: best, excellent, good, inaccuracy, mistake, blunder, forced
     
+    # New Lichess-style columns
+    pv = Column(Text, nullable=True) # Recommended continuation moves (space-separated UCI moves)
+    symbol = Column(String, nullable=True) # Move annotation symbol (e.g. !!, ?, ?!)
+    formatted_score = Column(String, nullable=True) # Human readable score representation (e.g. +1.50, #M4)
+    
     created_at = Column(DateTime(timezone=True), server_default=func.now())
